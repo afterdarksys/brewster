@@ -12,9 +12,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/afterdarktech/brewster/pkg/audit"
-	"github.com/afterdarktech/brewster/pkg/brew"
-	"github.com/afterdarktech/brewster/pkg/intel"
+	"github.com/afterdarksys/brewster/pkg/audit"
+	"github.com/afterdarksys/brewster/pkg/brew"
+	"github.com/afterdarksys/brewster/pkg/intel"
 )
 
 // VetConfig holds vetting configuration

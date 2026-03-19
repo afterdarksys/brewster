@@ -6,9 +6,9 @@ import (
 	"os"
 	"strings"
 
-	"github.com/afterdarktech/brewster/pkg/audit"
-	"github.com/afterdarktech/brewster/pkg/monitor"
-	"github.com/afterdarktech/brewster/pkg/vetting"
+	"github.com/afterdarksys/brewster/pkg/audit"
+	"github.com/afterdarksys/brewster/pkg/monitor"
+	"github.com/afterdarksys/brewster/pkg/vetting"
 	"gopkg.in/yaml.v3"
 )
 

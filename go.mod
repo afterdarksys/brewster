@@ -1,4 +1,4 @@
-module github.com/afterdarktech/brewster
+module github.com/afterdarksys/brewster
 
 go 1.25.2
 

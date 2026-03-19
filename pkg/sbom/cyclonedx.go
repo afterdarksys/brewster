@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/afterdarktech/brewster/pkg/brew"
+	"github.com/afterdarksys/brewster/pkg/brew"
 )
 
 // OutputFormat defines the format of the SBOM.

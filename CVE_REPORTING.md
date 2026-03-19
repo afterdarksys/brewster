@@ -311,6 +311,6 @@ Future enhancements:
 ## Support
 
 For issues or questions:
-- GitHub Issues: https://github.com/afterdarktech/brewster/issues
+- GitHub Issues: https://github.com/afterdarksys/brewster/issues
 - Documentation: https://docs.afterdarktech.com/brewster
 - Email: support@afterdarktech.com

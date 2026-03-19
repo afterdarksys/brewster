@@ -4,13 +4,13 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/afterdarktech/brewster/internal/config"
-	"github.com/afterdarktech/brewster/pkg/audit"
-	"github.com/afterdarktech/brewster/pkg/brew"
-	"github.com/afterdarktech/brewster/pkg/monitor"
-	"github.com/afterdarktech/brewster/pkg/report"
-	"github.com/afterdarktech/brewster/pkg/sbom"
-	"github.com/afterdarktech/brewster/pkg/vetting"
+	"github.com/afterdarksys/brewster/internal/config"
+	"github.com/afterdarksys/brewster/pkg/audit"
+	"github.com/afterdarksys/brewster/pkg/brew"
+	"github.com/afterdarksys/brewster/pkg/monitor"
+	"github.com/afterdarksys/brewster/pkg/report"
+	"github.com/afterdarksys/brewster/pkg/sbom"
+	"github.com/afterdarksys/brewster/pkg/vetting"
 	"github.com/spf13/cobra"
 )
 

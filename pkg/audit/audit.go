@@ -9,9 +9,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/afterdarktech/brewster/internal/config"
-	"github.com/afterdarktech/brewster/pkg/brew"
-	"github.com/afterdarktech/brewster/pkg/darkapi"
+	"github.com/afterdarksys/brewster/internal/config"
+	"github.com/afterdarksys/brewster/pkg/brew"
+	"github.com/afterdarksys/brewster/pkg/darkapi"
 )
 
 // Severity levels for findings
