@@ -1,0 +1,9 @@
+.claude
+.code-review-graph
+
+
+# build output (rebuildable via Makefile)
+/brewster
+*.test
+*.out
+coverage.*

@@ -5,12 +5,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/afterdarksys/brewster/internal/config"
 	"github.com/afterdarksys/brewster/pkg/brew"
+	"github.com/afterdarksys/brewster/pkg/cve"
 	"github.com/afterdarksys/brewster/pkg/darkapi"
 )
 
@@ -137,7 +139,7 @@ func RunLocalAudit(cfg config.AuditConfig) (*AuditResult, error) {
 
 	// Check for CVEs
 	if cfg.CheckCVE {
-		findings := checkCVEs(packages, cfg.Verbose)
+		findings := checkCVEs(packages, cfg)
 		result.Findings = append(result.Findings, findings...)
 
 		// Submit CVE findings to DarkAPI if enabled
@@ -238,117 +240,82 @@ func checkAbandoned(pkg brew.InstalledPackage, verbose bool) []Finding {
 	return findings
 }
 
-func checkCVEs(packages []brew.InstalledPackage, verbose bool) []Finding {
-	var findings []Finding
+func checkCVEs(packages []brew.InstalledPackage, cfg config.AuditConfig) []Finding {
+	matcher := cve.NewMatcher(cve.Config{Source: cfg.CVESource, NVDAPIKey: cfg.NVDAPIKey})
 
-	// Query OSV.dev for known vulnerabilities
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	var findings []Finding
+	scanErrors := 0
+
 	for _, pkg := range packages {
-		cves := queryOSV(pkg.Name, pkg.Version)
-		for _, cve := range cves {
+		res := matcher.ScanPackage(ctx, cve.Package{
+			Name:     pkg.Name,
+			Version:  pkg.Version,
+			Homepage: pkg.Homepage,
+			URL:      pkg.URL,
+		})
+		scanErrors += len(res.Errors)
+		if cfg.Verbose {
+			for _, e := range res.Errors {
+				fmt.Fprintf(os.Stderr, "[cve] %s: %v\n", pkg.Name, e)
+			}
+		}
+		for _, v := range res.Vulns {
 			findings = append(findings, Finding{
 				Package:     pkg.FullName,
 				Type:        FindingCVE,
-				Severity:    cve.Severity,
-				Title:       fmt.Sprintf("Known vulnerability: %s", cve.ID),
-				Description: cve.Summary,
-				CVE:         cve.ID,
-				URL:         cve.Reference,
-				Remediation: "Update to a patched version or apply workarounds",
+				Severity:    toAuditSeverity(v.Severity),
+				Title:       fmt.Sprintf("Known vulnerability: %s", v.ID),
+				Description: v.Summary,
+				CVE:         v.ID,
+				URL:         v.Reference,
+				Remediation: cveRemediation(v),
 			})
 		}
+	}
+
+	// Fail loud: a lookup that errored is NOT a clean result. Surface it so an
+	// empty findings list is never silently mistaken for "no vulnerabilities" —
+	// the exact failure the old Homebrew-ecosystem query produced on every run.
+	if scanErrors > 0 {
+		findings = append(findings, Finding{
+			Type:        FindingCVE,
+			Severity:    SeverityInfo,
+			Title:       "CVE scan degraded",
+			Description: fmt.Sprintf("%d vulnerability-source error(s) occurred; CVE results may be incomplete.", scanErrors),
+			Remediation: "Re-run with --verbose; check access to api.osv.dev / services.nvd.nist.gov and NVD_API_KEY.",
+		})
 	}
 
 	return findings
 }
 
-type osvVuln struct {
-	ID        string
-	Summary   string
-	Severity  Severity
-	Reference string
-}
-
-func queryOSV(name, version string) []osvVuln {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	// Query OSV.dev API
-	payload := fmt.Sprintf(`{"package":{"name":"%s","ecosystem":"Homebrew"},"version":"%s"}`, name, version)
-	req, err := http.NewRequestWithContext(ctx, "POST",
-		"https://api.osv.dev/v1/query",
-		strings.NewReader(payload))
-	if err != nil {
-		return nil
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return nil
-	}
-	defer resp.Body.Close()
-
-	var result struct {
-		Vulns []struct {
-			ID         string `json:"id"`
-			Summary    string `json:"summary"`
-			Severity   []struct {
-				Type  string `json:"type"`
-				Score string `json:"score"`
-			} `json:"severity"`
-			References []struct {
-				Type string `json:"type"`
-				URL  string `json:"url"`
-			} `json:"references"`
-		} `json:"vulns"`
-	}
-
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil
-	}
-
-	var vulns []osvVuln
-	for _, v := range result.Vulns {
-		sev := SeverityMedium // default
-		for _, s := range v.Severity {
-			if s.Type == "CVSS_V3" {
-				// Parse CVSS score
-				sev = cvssToSeverity(s.Score)
-				break
-			}
-		}
-
-		ref := ""
-		for _, r := range v.References {
-			if r.Type == "ADVISORY" || ref == "" {
-				ref = r.URL
-			}
-		}
-
-		vulns = append(vulns, osvVuln{
-			ID:        v.ID,
-			Summary:   v.Summary,
-			Severity:  sev,
-			Reference: ref,
-		})
-	}
-
-	return vulns
-}
-
-func cvssToSeverity(score string) Severity {
-	// CVSS v3 score ranges
-	// This is a simplified parsing
-	if strings.Contains(score, "9.") || strings.Contains(score, "10.") {
+func toAuditSeverity(s cve.Severity) Severity {
+	switch s {
+	case cve.SeverityCritical:
 		return SeverityCritical
-	}
-	if strings.Contains(score, "7.") || strings.Contains(score, "8.") {
+	case cve.SeverityHigh:
 		return SeverityHigh
-	}
-	if strings.Contains(score, "4.") || strings.Contains(score, "5.") || strings.Contains(score, "6.") {
+	case cve.SeverityMedium:
+		return SeverityMedium
+	case cve.SeverityLow:
+		return SeverityLow
+	default:
+		// A matched CVE whose severity couldn't be determined still warrants
+		// review, so surface it as MEDIUM rather than INFO ("no action"). This
+		// is common for OSV Go-DB (GO-xxxx) records, whose severity lives only
+		// on their GHSA/CVE alias — resolving that alias is a possible follow-up.
 		return SeverityMedium
 	}
-	return SeverityLow
+}
+
+func cveRemediation(v cve.Vuln) string {
+	if v.FixedIn != "" {
+		return fmt.Sprintf("Update to %s or later", v.FixedIn)
+	}
+	return "Update to a patched version or apply available workarounds"
 }
 
 func calculateSummary(findings []Finding) Summary {

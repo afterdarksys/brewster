@@ -18,6 +18,7 @@ var (
 	version   = "0.1.0"
 	outputFmt string
 	verbose   bool
+	cveSource string
 )
 
 func main() {
@@ -32,6 +33,7 @@ Detect bad distributors, abandoned projects, supply chain risks, and more.`,
 
 	rootCmd.PersistentFlags().StringVarP(&outputFmt, "output", "o", "table", "Output format: table, json, yaml")
 	rootCmd.PersistentFlags().BoolVarP(&verbose, "verbose", "v", false, "Verbose output")
+	rootCmd.PersistentFlags().StringVar(&cveSource, "cve-source", "", "CVE source: auto|osv|nvd|both (default auto; also env BREWSTER_CVE_SOURCE / NVD_API_KEY)")
 
 	// Subcommands
 	rootCmd.AddCommand(auditCmd())
@@ -71,11 +73,14 @@ func auditCmd() *cobra.Command {
 				darkAPIURL = os.Getenv("DARKAPI_URL")
 			}
 
+			cveSrc, nvdKey := config.ResolveCVE(cveSource, "")
 			cfg := config.AuditConfig{
 				CheckCVE:        checkCVE,
 				CheckAbandoned:  checkAbandoned,
 				CheckHTTP:       checkHTTP,
 				Verbose:         verbose,
+				CVESource:       cveSrc,
+				NVDAPIKey:       nvdKey,
 				SubmitToDarkAPI: submitToDarkAPI,
 				DarkAPIURL:      darkAPIURL,
 				DarkAPIKey:      darkAPIKey,
@@ -145,7 +150,8 @@ func monitorCVECmd() *cobra.Command {
 		Use:   "cve",
 		Short: "Check ecosystem for CVE-affected packages",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			results, err := monitor.CheckCVEs(monitor.Config{Verbose: verbose})
+			cveSrc, nvdKey := config.ResolveCVE(cveSource, "")
+			results, err := monitor.CheckCVEs(monitor.Config{Verbose: verbose, Source: cveSrc, NVDAPIKey: nvdKey})
 			if err != nil {
 				return fmt.Errorf("CVE check failed: %w", err)
 			}
@@ -192,11 +198,14 @@ func scanCmd() *cobra.Command {
 
 			// Run local audit
 			fmt.Println("\n[1/3] Auditing local installation...")
+			cveSrc, nvdKey := config.ResolveCVE(cveSource, "")
 			auditResults, err := audit.RunLocalAudit(config.AuditConfig{
 				CheckCVE:        true,
 				CheckAbandoned:  true,
 				CheckHTTP:       true,
 				Verbose:         verbose,
+				CVESource:       cveSrc,
+				NVDAPIKey:       nvdKey,
 				SubmitToDarkAPI: submitToDarkAPI,
 				DarkAPIURL:      darkAPIURL,
 				DarkAPIKey:      darkAPIKey,
@@ -214,7 +223,7 @@ func scanCmd() *cobra.Command {
 
 			// Ecosystem check
 			fmt.Println("\n[3/3] Checking ecosystem intelligence...")
-			monitorResults, err := monitor.CheckCVEs(monitor.Config{Verbose: verbose})
+			monitorResults, err := monitor.CheckCVEs(monitor.Config{Verbose: verbose, Source: cveSrc, NVDAPIKey: nvdKey})
 			if err != nil {
 				fmt.Printf("  ⚠️  Monitor error: %v\n", err)
 			}

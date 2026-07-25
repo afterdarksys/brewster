@@ -5,16 +5,20 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
 	"github.com/afterdarksys/brewster/pkg/audit"
 	"github.com/afterdarksys/brewster/pkg/brew"
+	"github.com/afterdarksys/brewster/pkg/cve"
 )
 
 // Config holds monitor configuration
 type Config struct {
-	Verbose bool
+	Verbose   bool
+	Source    string // CVE source: "auto" | "osv" | "nvd" | "both"
+	NVDAPIKey string
 }
 
 // CVEResult holds CVE monitoring results
@@ -71,12 +75,26 @@ func CheckCVEs(cfg Config) (*CVEResult, error) {
 		fmt.Printf("  Checking %d packages for known vulnerabilities...\n", len(packages))
 	}
 
+	matcher := cve.NewMatcher(cve.Config{Source: cfg.Source, NVDAPIKey: cfg.NVDAPIKey})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	scanErrors := 0
 	for _, pkg := range packages {
-		vulns := queryVulnerabilities(pkg.Name, pkg.Version, cfg.Verbose)
+		vulns, errs := scanPackage(ctx, matcher, pkg)
 		result.Vulnerabilities = append(result.Vulnerabilities, vulns...)
+		scanErrors += len(errs)
+		if cfg.Verbose {
+			for _, e := range errs {
+				fmt.Fprintf(os.Stderr, "[cve] %s: %v\n", pkg.Name, e)
+			}
+		}
 	}
 
 	result.VulnCount = len(result.Vulnerabilities)
+	if scanErrors > 0 && cfg.Verbose {
+		fmt.Fprintf(os.Stderr, "[cve] %d source error(s); results may be incomplete\n", scanErrors)
+	}
 	return result, nil
 }
 
@@ -110,219 +128,49 @@ func AnalyzeTaps(cfg Config) (*TapAnalysisResult, error) {
 	return result, nil
 }
 
-func queryVulnerabilities(name, version string, verbose bool) []VulnInfo {
+// scanPackage resolves vulnerabilities for one formula via the shared CVE
+// matcher (OSV with real ecosystem mapping + NVD/CPE). It replaces two broken
+// implementations: the old queryOSV, which asked OSV for a non-existent
+// "Homebrew" ecosystem (matching nothing), and queryNVD, which flagged any CVE
+// whose description merely mentioned the formula name while ignoring the
+// installed version (a false-positive firehose for names like git/go/less).
+func scanPackage(ctx context.Context, m *cve.Matcher, pkg brew.InstalledPackage) ([]VulnInfo, []error) {
+	res := m.ScanPackage(ctx, cve.Package{
+		Name:     pkg.Name,
+		Version:  pkg.Version,
+		Homepage: pkg.Homepage,
+		URL:      pkg.URL,
+	})
 	var vulns []VulnInfo
-
-	// Query OSV.dev
-	osvVulns := queryOSV(name, version)
-	vulns = append(vulns, osvVulns...)
-
-	// Query NVD (National Vulnerability Database) - simplified
-	nvdVulns := queryNVD(name, version)
-	vulns = append(vulns, nvdVulns...)
-
-	return vulns
-}
-
-func queryOSV(name, version string) []VulnInfo {
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-
-	// Try multiple ecosystems
-	ecosystems := []string{"Homebrew", "PyPI", "npm", "Go", "crates.io"}
-	var allVulns []VulnInfo
-
-	for _, ecosystem := range ecosystems {
-		payload := fmt.Sprintf(`{"package":{"name":"%s","ecosystem":"%s"},"version":"%s"}`, name, ecosystem, version)
-
-		req, err := http.NewRequestWithContext(ctx, "POST",
-			"https://api.osv.dev/v1/query",
-			strings.NewReader(payload))
-		if err != nil {
-			continue
-		}
-		req.Header.Set("Content-Type", "application/json")
-
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			continue
-		}
-
-		var result struct {
-			Vulns []struct {
-				ID        string    `json:"id"`
-				Summary   string    `json:"summary"`
-				Published time.Time `json:"published"`
-				Severity  []struct {
-					Type  string `json:"type"`
-					Score string `json:"score"`
-				} `json:"severity"`
-				Affected []struct {
-					Ranges []struct {
-						Events []struct {
-							Fixed string `json:"fixed"`
-						} `json:"events"`
-					} `json:"ranges"`
-				} `json:"affected"`
-				References []struct {
-					Type string `json:"type"`
-					URL  string `json:"url"`
-				} `json:"references"`
-			} `json:"vulns"`
-		}
-
-		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-			resp.Body.Close()
-			continue
-		}
-		resp.Body.Close()
-
-		for _, v := range result.Vulns {
-			vuln := VulnInfo{
-				Package:   name,
-				Version:   version,
-				CVEID:     v.ID,
-				Summary:   v.Summary,
-				Published: v.Published,
-				Severity:  audit.SeverityMedium,
-			}
-
-			// Get severity
-			for _, s := range v.Severity {
-				if s.Type == "CVSS_V3" {
-					vuln.Severity = cvssToSeverity(s.Score)
-					break
-				}
-			}
-
-			// Get fixed version
-			for _, aff := range v.Affected {
-				for _, r := range aff.Ranges {
-					for _, e := range r.Events {
-						if e.Fixed != "" {
-							vuln.FixedIn = e.Fixed
-						}
-					}
-				}
-			}
-
-			// Get reference URL
-			for _, ref := range v.References {
-				if ref.Type == "ADVISORY" {
-					vuln.Reference = ref.URL
-					break
-				}
-				if vuln.Reference == "" {
-					vuln.Reference = ref.URL
-				}
-			}
-
-			allVulns = append(allVulns, vuln)
-		}
-	}
-
-	return allVulns
-}
-
-func queryNVD(name, version string) []VulnInfo {
-	// NVD API query (simplified - in production you'd want proper API key)
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	// Search by keyword
-	url := fmt.Sprintf("https://services.nvd.nist.gov/rest/json/cves/2.0?keywordSearch=%s", name)
-
-	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
-	if err != nil {
-		return nil
-	}
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return nil
-	}
-	defer resp.Body.Close()
-
-	// NVD has rate limiting, so we just do basic queries
-	if resp.StatusCode != 200 {
-		return nil
-	}
-
-	var nvdResult struct {
-		Vulnerabilities []struct {
-			CVE struct {
-				ID           string `json:"id"`
-				Descriptions []struct {
-					Lang  string `json:"lang"`
-					Value string `json:"value"`
-				} `json:"descriptions"`
-				Metrics struct {
-					CvssMetricV31 []struct {
-						CvssData struct {
-							BaseScore    float64 `json:"baseScore"`
-							BaseSeverity string  `json:"baseSeverity"`
-						} `json:"cvssData"`
-					} `json:"cvssMetricV31"`
-				} `json:"metrics"`
-			} `json:"cve"`
-		} `json:"vulnerabilities"`
-	}
-
-	if err := json.NewDecoder(resp.Body).Decode(&nvdResult); err != nil {
-		return nil
-	}
-
-	var vulns []VulnInfo
-	for _, v := range nvdResult.Vulnerabilities {
-		// Only include if the CVE ID suggests relevance to the package
-		if !strings.Contains(strings.ToLower(v.CVE.ID), strings.ToLower(name)) {
-			// Check description for package name
-			relevant := false
-			for _, desc := range v.CVE.Descriptions {
-				if strings.Contains(strings.ToLower(desc.Value), strings.ToLower(name)) {
-					relevant = true
-					break
-				}
-			}
-			if !relevant {
-				continue
-			}
-		}
-
-		summary := ""
-		for _, desc := range v.CVE.Descriptions {
-			if desc.Lang == "en" {
-				summary = desc.Value
-				break
-			}
-		}
-
-		severity := audit.SeverityMedium
-		if len(v.CVE.Metrics.CvssMetricV31) > 0 {
-			score := v.CVE.Metrics.CvssMetricV31[0].CvssData.BaseScore
-			switch {
-			case score >= 9.0:
-				severity = audit.SeverityCritical
-			case score >= 7.0:
-				severity = audit.SeverityHigh
-			case score >= 4.0:
-				severity = audit.SeverityMedium
-			default:
-				severity = audit.SeverityLow
-			}
-		}
-
+	for _, v := range res.Vulns {
 		vulns = append(vulns, VulnInfo{
-			Package:   name,
-			Version:   version,
-			CVEID:     v.CVE.ID,
-			Severity:  severity,
-			Summary:   summary,
-			Reference: fmt.Sprintf("https://nvd.nist.gov/vuln/detail/%s", v.CVE.ID),
+			Package:   pkg.Name,
+			Version:   pkg.Version,
+			CVEID:     v.ID,
+			Severity:  toAuditSeverity(v.Severity),
+			Summary:   v.Summary,
+			FixedIn:   v.FixedIn,
+			Reference: v.Reference,
 		})
 	}
+	return vulns, res.Errors
+}
 
-	return vulns
+func toAuditSeverity(s cve.Severity) audit.Severity {
+	switch s {
+	case cve.SeverityCritical:
+		return audit.SeverityCritical
+	case cve.SeverityHigh:
+		return audit.SeverityHigh
+	case cve.SeverityMedium:
+		return audit.SeverityMedium
+	case cve.SeverityLow:
+		return audit.SeverityLow
+	default:
+		// Indeterminate severity on a matched CVE -> MEDIUM (needs triage),
+		// not INFO. See pkg/audit.toAuditSeverity for rationale.
+		return audit.SeverityMedium
+	}
 }
 
 func analyzeTap(tap brew.Tap, cfg Config) []TapFinding {
@@ -432,15 +280,3 @@ func analyzeTap(tap brew.Tap, cfg Config) []TapFinding {
 	return findings
 }
 
-func cvssToSeverity(score string) audit.Severity {
-	if strings.Contains(score, "9.") || strings.Contains(score, "10.") {
-		return audit.SeverityCritical
-	}
-	if strings.Contains(score, "7.") || strings.Contains(score, "8.") {
-		return audit.SeverityHigh
-	}
-	if strings.Contains(score, "4.") || strings.Contains(score, "5.") || strings.Contains(score, "6.") {
-		return audit.SeverityMedium
-	}
-	return audit.SeverityLow
-}
