@@ -1,16 +1,9 @@
 // Package cve resolves known vulnerabilities for installed Homebrew packages.
 //
-// Homebrew is not a first-class OSV.dev ecosystem, so a single
-// {"ecosystem":"Homebrew"} query (as the original audit code did) always
-// returns nothing — turning the scanner into a silent no-op. This package maps
-// each formula to the coordinates the upstream databases actually use: OSV
-// ecosystems (PyPI/npm/Go/crates.io/...) where a formula is a real package, and
-// NVD CPE product names for system libraries. Two rules the old code broke:
-//
-//  1. Requests are built with encoding/json, never fmt.Sprintf, so a formula
-//     name or version containing a quote or backslash cannot corrupt the query.
-//  2. Lookups fail loud: a transport, HTTP-status, or decode failure returns an
-//     error instead of an empty slice that would masquerade as "no vulns".
+// Threats: query bodies are encoding/json and CPE fields are escaped. Transport,
+// HTTP, decode, oversize, pagination, and unknown-source failures return an
+// error and keep any vulns already found. Feeds are trusted only over HTTPS.
+// Formulae with no curated coordinate are skipped.
 package cve
 
 import (
@@ -18,6 +11,8 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 )
 
 // Severity is a normalized severity level.
@@ -41,7 +36,8 @@ type Package struct {
 
 // Vuln is a single matched vulnerability.
 type Vuln struct {
-	ID        string // CVE or OSV id
+	ID        string   // preferred id: CVE alias when the feed has one, else the feed id
+	Aliases   []string // other ids (GHSA, GO-..., additional CVEs)
 	Summary   string
 	Severity  Severity
 	Reference string
@@ -51,11 +47,9 @@ type Vuln struct {
 	Version   string
 }
 
-// Source is one vulnerability database backend.
+// Source is one vulnerability database. Query must return an error on
+// transport, HTTP, or decode failure, not an empty slice.
 type Source interface {
-	// Query returns vulns for a package. It MUST return a non-nil error on any
-	// transport/HTTP/decode failure rather than an empty slice, so the caller
-	// can distinguish "clean" from "the lookup broke".
 	Query(ctx context.Context, p Package) ([]Vuln, error)
 	Name() string
 }
@@ -72,34 +66,50 @@ type Config struct {
 
 // Matcher fans a package out across the configured sources.
 type Matcher struct {
-	sources []Source
+	sources    []Source
+	keylessNVD bool
 }
 
-// NewMatcher builds a Matcher from config, applying the "auto" default.
-func NewMatcher(cfg Config) *Matcher {
+const (
+	scanConcurrency = 4
+	packageTimeout  = 2 * time.Minute
+)
+
+func NewMatcher(cfg Config) (*Matcher, error) {
 	src := strings.ToLower(strings.TrimSpace(cfg.Source))
 	if src == "" {
 		src = "auto"
 	}
 
 	var sources []Source
+	keylessNVD := false
 	switch src {
 	case "osv":
 		sources = []Source{NewOSVSource()}
 	case "nvd":
 		sources = []Source{NewNVDSource(cfg.NVDAPIKey)}
+		keylessNVD = strings.TrimSpace(cfg.NVDAPIKey) == ""
 	case "both":
 		sources = []Source{NewOSVSource(), NewNVDSource(cfg.NVDAPIKey)}
-	default: // auto
+		keylessNVD = strings.TrimSpace(cfg.NVDAPIKey) == ""
+	case "auto":
 		sources = []Source{NewOSVSource()}
 		if strings.TrimSpace(cfg.NVDAPIKey) != "" {
 			sources = append(sources, NewNVDSource(cfg.NVDAPIKey))
 		}
+	default:
+		return nil, fmt.Errorf("unknown cve source %q (want auto, osv, nvd, or both)", src)
 	}
-	return &Matcher{sources: sources}
+	return &Matcher{sources: sources, keylessNVD: keylessNVD}, nil
 }
 
-// Sources reports the active backend names (for verbose/status output).
+func (m *Matcher) Warning() string {
+	if m != nil && m.keylessNVD {
+		return "NVD is enabled without an API key (about 5 requests per 30s). Set NVD_API_KEY."
+	}
+	return ""
+}
+
 func (m *Matcher) Sources() []string {
 	names := make([]string, 0, len(m.sources))
 	for _, s := range m.sources {
@@ -108,15 +118,35 @@ func (m *Matcher) Sources() []string {
 	return names
 }
 
-// Result holds the vulns found for a package plus any per-source errors.
-// Errors are non-fatal (other sources still run) but MUST be surfaced by the
-// caller — a degraded scan is not a clean scan.
 type Result struct {
 	Vulns  []Vuln
 	Errors []error
 }
 
-// ScanPackage queries every source and de-duplicates by (package, id).
+// ScanAll keeps input order. Each package has its own timeout.
+func (m *Matcher) ScanAll(ctx context.Context, pkgs []Package) []Result {
+	out := make([]Result, len(pkgs))
+	sem := make(chan struct{}, scanConcurrency)
+	var wg sync.WaitGroup
+	for i, p := range pkgs {
+		if err := ctx.Err(); err != nil {
+			out[i].Errors = []error{err}
+			continue
+		}
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(i int, p Package) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			pctx, cancel := context.WithTimeout(ctx, packageTimeout)
+			defer cancel()
+			out[i] = m.ScanPackage(pctx, p)
+		}(i, p)
+	}
+	wg.Wait()
+	return out
+}
+
 func (m *Matcher) ScanPackage(ctx context.Context, p Package) Result {
 	var res Result
 	seen := make(map[string]bool)
@@ -124,7 +154,6 @@ func (m *Matcher) ScanPackage(ctx context.Context, p Package) Result {
 		vulns, err := s.Query(ctx, p)
 		if err != nil {
 			res.Errors = append(res.Errors, fmt.Errorf("%s: %w", s.Name(), err))
-			continue
 		}
 		for _, v := range vulns {
 			key := v.Package + "\x00" + v.ID
@@ -170,9 +199,6 @@ func severityFromLabel(label string) Severity {
 	}
 }
 
-// severityFromCVSS best-effort parses an OSV severity score field, which may be
-// a bare number ("7.5") or a CVSS vector string. We only trust a numeric base
-// score; a vector without a computed score yields Unknown (honest over guessed).
 func severityFromCVSS(score string) Severity {
 	score = strings.TrimSpace(score)
 	if score == "" {

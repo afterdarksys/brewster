@@ -30,8 +30,12 @@ func TestOSVCoordinates(t *testing.T) {
 		{"curated pypi", Package{Name: "awscli"}, []osvCoord{{"PyPI", "awscli"}}},
 		{"pypi url", Package{Name: "x", URL: "https://pypi.org/project/requests/"}, []osvCoord{{"PyPI", "requests"}}},
 		{"crates url", Package{Name: "x", URL: "https://crates.io/crates/tokio"}, []osvCoord{{"crates.io", "tokio"}}},
-		{"github->go", Package{Name: "x", URL: "https://github.com/cli/cli.git"}, []osvCoord{{"Go", "github.com/cli/cli"}}},
-		{"versioned name strips @", Package{Name: "openssl@3"}, nil}, // no confident coord -> NVD handles it
+		{"pypi source url uses name not letter", Package{Name: "x", URL: "https://files.pythonhosted.org/packages/source/r/requests/requests-2.28.0.tar.gz"}, []osvCoord{{"PyPI", "requests"}}},
+		{"notpypi.org is not pypi", Package{Name: "x", URL: "https://notpypi.org/project/requests/"}, nil},
+		{"github tarball is not a go module", Package{Name: "curl", URL: "https://github.com/curl/curl/archive/refs/tags/curl-8.7.1.tar.gz"}, nil},
+		{"pkg.go.dev", Package{Name: "x", URL: "https://pkg.go.dev/github.com/cli/cli"}, []osvCoord{{"Go", "github.com/cli/cli"}}},
+		{"curated go tool", Package{Name: "gh"}, []osvCoord{{"Go", "github.com/cli/cli"}}},
+		{"versioned name strips @", Package{Name: "openssl@3"}, nil}, // no OSV coord; NVD curated CPE covers it
 		{"unmapped", Package{Name: "curl"}, nil},
 	}
 	for _, tc := range cases {
@@ -122,9 +126,9 @@ func TestOSVDecodeErrorFailsLoud(t *testing.T) {
 func TestOSVMapsVulns(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte(`{"vulns":[{
-			"id":"CVE-2021-0001","summary":"bad thing",
+			"id":"GHSA-xxxx","aliases":["CVE-2021-0001"],"summary":"bad thing",
 			"severity":[{"type":"CVSS_V3","score":"9.8"}],
-			"affected":[{"ranges":[{"events":[{"fixed":"13.0.1"}]}]}],
+			"affected":[{"package":{"ecosystem":"crates.io","name":"ripgrep"},"ranges":[{"events":[{"introduced":"0"},{"fixed":"13.0.1"}]}]}],
 			"references":[{"type":"WEB","url":"https://x"},{"type":"ADVISORY","url":"https://adv"}]
 		}]}`))
 	}))
@@ -142,6 +146,9 @@ func TestOSVMapsVulns(t *testing.T) {
 		v.Reference != "https://adv" || v.Source != "osv" || v.Package != "ripgrep" {
 		t.Fatalf("bad mapping: %+v", v)
 	}
+	if len(v.Aliases) != 1 || v.Aliases[0] != "GHSA-xxxx" {
+		t.Fatalf("aliases = %v", v.Aliases)
+	}
 }
 
 // ---- NVD source ----
@@ -151,7 +158,7 @@ func TestNVDBuildsVersionedCPEAndParses(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotCPE = r.URL.Query().Get("virtualMatchString")
 		gotKey = r.Header.Get("apiKey")
-		w.Write([]byte(`{"vulnerabilities":[{"cve":{
+		w.Write([]byte(`{"totalResults":1,"vulnerabilities":[{"cve":{
 			"id":"CVE-2022-1234",
 			"descriptions":[{"lang":"en","value":"heap overflow"}],
 			"metrics":{"cvssMetricV31":[{"cvssData":{"baseScore":7.5,"baseSeverity":"HIGH"}}]},
@@ -164,8 +171,8 @@ func TestNVDBuildsVersionedCPEAndParses(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// product from @-stripped name, version from _-stripped version.
-	if gotCPE != "cpe:2.3:a:*:openssl:3.0.0:*:*:*:*:*:*:*" {
+	// curated vendor/product, @-stripped name, _-stripped version.
+	if gotCPE != "cpe:2.3:a:openssl:openssl:3.0.0:*:*:*:*:*:*:*" {
 		t.Fatalf("bad CPE match string: %q", gotCPE)
 	}
 	if gotKey != "secret-key" {
@@ -196,19 +203,29 @@ func TestMatcherSourceSelection(t *testing.T) {
 		key  string
 		want []string
 	}{
-		{"", "", []string{"osv"}},               // default auto, no key
-		{"auto", "", []string{"osv"}},            // auto, no key
-		{"auto", "k", []string{"osv", "nvd"}},    // auto, key present
-		{"osv", "k", []string{"osv"}},            // forced osv
-		{"nvd", "k", []string{"nvd"}},            // forced nvd
-		{"both", "", []string{"osv", "nvd"}},     // both regardless of key
-		{"AUTO", "k", []string{"osv", "nvd"}},    // case-insensitive
+		{"", "", []string{"osv"}},             // default auto, no key
+		{"auto", "", []string{"osv"}},         // auto, no key
+		{"auto", "k", []string{"osv", "nvd"}}, // auto, key present
+		{"osv", "k", []string{"osv"}},         // forced osv
+		{"nvd", "k", []string{"nvd"}},         // forced nvd
+		{"both", "", []string{"osv", "nvd"}},  // both regardless of key
+		{"AUTO", "k", []string{"osv", "nvd"}}, // case-insensitive
 	}
 	for _, tc := range cases {
-		got := NewMatcher(Config{Source: tc.src, NVDAPIKey: tc.key}).Sources()
+		m, err := NewMatcher(Config{Source: tc.src, NVDAPIKey: tc.key})
+		if err != nil {
+			t.Fatalf("src=%q: %v", tc.src, err)
+		}
+		got := m.Sources()
 		if strings.Join(got, ",") != strings.Join(tc.want, ",") {
 			t.Errorf("src=%q key=%q: got %v, want %v", tc.src, tc.key, got, tc.want)
 		}
+	}
+}
+
+func TestMatcherRejectsUnknownSource(t *testing.T) {
+	if _, err := NewMatcher(Config{Source: "ossv"}); err == nil {
+		t.Fatal("unknown source was treated as a real backend")
 	}
 }
 
@@ -227,8 +244,8 @@ func TestScanPackageDedupeAndErrors(t *testing.T) {
 	dup := Vuln{ID: "CVE-1", Package: "curl"}
 	m := &Matcher{sources: []Source{
 		stubSource{name: "a", vulns: []Vuln{dup, {ID: "CVE-2", Package: "curl"}}},
-		stubSource{name: "b", vulns: []Vuln{dup}},                     // duplicate -> collapsed
-		stubSource{name: "c", err: context.DeadlineExceeded},          // error -> surfaced, not silent
+		stubSource{name: "b", vulns: []Vuln{dup}},            // duplicate -> collapsed
+		stubSource{name: "c", err: context.DeadlineExceeded}, // error -> surfaced, not silent
 	}}
 	res := m.ScanPackage(ctx(t), Package{Name: "curl"})
 	if len(res.Vulns) != 2 {
@@ -239,5 +256,172 @@ func TestScanPackageDedupeAndErrors(t *testing.T) {
 	}
 	if !strings.Contains(res.Errors[0].Error(), "c:") {
 		t.Fatalf("error not attributed to source: %v", res.Errors[0])
+	}
+}
+
+func TestScanPackageKeepsVulnsWhenSourceErrors(t *testing.T) {
+	m := &Matcher{sources: []Source{
+		stubSource{name: "a", vulns: []Vuln{{ID: "CVE-1", Package: "curl"}}, err: context.DeadlineExceeded},
+	}}
+	res := m.ScanPackage(ctx(t), Package{Name: "curl"})
+	if len(res.Vulns) != 1 || res.Vulns[0].ID != "CVE-1" {
+		t.Fatalf("partial vulns dropped: %+v", res.Vulns)
+	}
+	if len(res.Errors) != 1 {
+		t.Fatalf("error dropped: %+v", res.Errors)
+	}
+}
+
+func TestOSVKeepsEarlierCoordWhenLaterFails(t *testing.T) {
+	var n int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n++
+		if n == 1 {
+			w.Write([]byte(`{"vulns":[{"id":"CVE-1","summary":"from crates"}]}`))
+			return
+		}
+		http.Error(w, "nope", http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+	src := &OSVSource{Client: srv.Client(), Endpoint: srv.URL}
+	vulns, err := src.Query(ctx(t), Package{
+		Name:    "ripgrep",
+		Version: "14.0.0",
+		URL:     "https://pypi.org/project/requests/",
+	})
+	if err == nil {
+		t.Fatal("expected the second coordinate to fail")
+	}
+	if len(vulns) != 1 || vulns[0].ID != "CVE-1" {
+		t.Fatalf("first coordinate's vuln was dropped: %+v", vulns)
+	}
+}
+
+func TestOSVEmptyVersionDoesNotQuery(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Error("empty version must not be sent to OSV")
+	}))
+	defer srv.Close()
+	src := &OSVSource{Client: srv.Client(), Endpoint: srv.URL}
+	_, err := src.Query(ctx(t), Package{Name: "ripgrep"})
+	if err == nil {
+		t.Fatal("expected error for missing version")
+	}
+}
+
+func TestOSVFixedInSkipsOtherBranch(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"vulns":[{"id":"CVE-9","affected":[{"ranges":[
+			{"events":[{"introduced":"0"},{"fixed":"1.2.0"}]},
+			{"events":[{"introduced":"2.0.0"},{"fixed":"2.1.0"}]}
+		]}]}]}`))
+	}))
+	defer srv.Close()
+	src := &OSVSource{Client: srv.Client(), Endpoint: srv.URL}
+	vulns, err := src.Query(ctx(t), Package{Name: "ripgrep", Version: "2.0.5"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(vulns) != 1 || vulns[0].FixedIn != "2.1.0" {
+		t.Fatalf("fixed-in = %+v, want 2.1.0", vulns)
+	}
+}
+
+func TestNVDPaginates(t *testing.T) {
+	var starts []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := r.URL.Query().Get("startIndex")
+		starts = append(starts, start)
+		if start == "" || start == "0" {
+			w.Write([]byte(`{"totalResults":2,"vulnerabilities":[{"cve":{"id":"CVE-1","descriptions":[{"lang":"en","value":"one"}]}}]}`))
+			return
+		}
+		w.Write([]byte(`{"totalResults":2,"vulnerabilities":[{"cve":{"id":"CVE-2","descriptions":[{"lang":"en","value":"two"}]}}]}`))
+	}))
+	defer srv.Close()
+	src := &NVDSource{Client: srv.Client(), Endpoint: srv.URL, MinInterval: 0}
+	vulns, err := src.Query(ctx(t), Package{Name: "openssl", Version: "3.0.0"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(vulns) != 2 {
+		t.Fatalf("got %d vulns, want 2 (pagination dropped a page): %+v starts=%v", len(vulns), vulns, starts)
+	}
+}
+
+func TestNVDSkipsUnmappedFormula(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Error("unmapped formula must not be queried")
+	}))
+	defer srv.Close()
+	src := &NVDSource{Client: srv.Client(), Endpoint: srv.URL, MinInterval: 0}
+	vulns, err := src.Query(ctx(t), Package{Name: "not-a-real-formula", Version: "1.0.0"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(vulns) != 0 {
+		t.Fatalf("unexpected vulns: %+v", vulns)
+	}
+}
+
+func TestNVDRedirectDoesNotLeakAPIKey(t *testing.T) {
+	hits := 0
+	leak := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		if r.Header.Get("apiKey") != "" {
+			t.Error("api key followed a redirect")
+		}
+	}))
+	defer leak.Close()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, leak.URL, http.StatusFound)
+	}))
+	defer srv.Close()
+	src := NewNVDSource("secret-key")
+	src.Endpoint = srv.URL
+	src.MinInterval = 0
+	_, err := src.Query(ctx(t), Package{Name: "openssl", Version: "3.0.0"})
+	if err == nil {
+		t.Fatal("redirect was treated as a successful lookup")
+	}
+	if hits != 0 {
+		t.Fatalf("client followed redirect (%d hits)", hits)
+	}
+}
+
+func TestNVDRejectsOversizedBody(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"totalResults":1,"vulnerabilities":[{"cve":{"id":"CVE-1"}}]}`))
+	}))
+	defer srv.Close()
+	src := &NVDSource{Client: srv.Client(), Endpoint: srv.URL, MinInterval: 0, MaxBytes: 16}
+	if _, err := src.Query(ctx(t), Package{Name: "openssl", Version: "3.0.0"}); err == nil {
+		t.Fatal("oversized body was accepted")
+	}
+}
+
+func TestEscapeCPE(t *testing.T) {
+	if got := escapeCPE("1.2.3+dfsg"); got != `1.2.3\+dfsg` {
+		t.Fatalf("got %q", got)
+	}
+	if got := escapeCPE("1:2"); got != `1\:2` {
+		t.Fatalf("got %q", got)
+	}
+	if got := escapeCPE("1.2.3"); got != "1.2.3" {
+		t.Fatalf("got %q", got)
+	}
+}
+
+func TestVersionLess(t *testing.T) {
+	less, ok := versionLess("1.2.3", "1.10.0")
+	if !ok || !less {
+		t.Fatalf("1.2.3 < 1.10.0: less=%v ok=%v", less, ok)
+	}
+	less, ok = versionLess("1.2.3", "1.2.3-rc1")
+	if !ok || less {
+		t.Fatalf("release should sort after rc: less=%v ok=%v", less, ok)
+	}
+	if _, ok := versionLess("HEAD", "1.0"); ok {
+		t.Fatal("HEAD should not compare as a version")
 	}
 }

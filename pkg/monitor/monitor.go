@@ -23,22 +23,24 @@ type Config struct {
 
 // CVEResult holds CVE monitoring results
 type CVEResult struct {
-	Timestamp      time.Time         `json:"timestamp"`
-	PackagesChecked int              `json:"packages_checked"`
-	VulnCount      int               `json:"vulnerable_count"`
-	Vulnerabilities []VulnInfo       `json:"vulnerabilities"`
+	Timestamp       time.Time  `json:"timestamp"`
+	PackagesChecked int        `json:"packages_checked"`
+	VulnCount       int        `json:"vulnerable_count"`
+	ScanErrors      int        `json:"scan_errors,omitempty"`
+	Vulnerabilities []VulnInfo `json:"vulnerabilities"`
 }
 
 // VulnInfo holds vulnerability information
 type VulnInfo struct {
-	Package     string         `json:"package"`
-	Version     string         `json:"version"`
-	CVEID       string         `json:"cve_id"`
-	Severity    audit.Severity `json:"severity"`
-	Summary     string         `json:"summary"`
-	Published   time.Time      `json:"published,omitempty"`
-	FixedIn     string         `json:"fixed_in,omitempty"`
-	Reference   string         `json:"reference,omitempty"`
+	Package   string         `json:"package"`
+	Version   string         `json:"version"`
+	CVEID     string         `json:"cve_id"`
+	Aliases   []string       `json:"aliases,omitempty"`
+	Severity  audit.Severity `json:"severity"`
+	Summary   string         `json:"summary"`
+	Published time.Time      `json:"published,omitempty"`
+	FixedIn   string         `json:"fixed_in,omitempty"`
+	Reference string         `json:"reference,omitempty"`
 }
 
 // TapAnalysisResult holds tap analysis results
@@ -75,25 +77,52 @@ func CheckCVEs(cfg Config) (*CVEResult, error) {
 		fmt.Printf("  Checking %d packages for known vulnerabilities...\n", len(packages))
 	}
 
-	matcher := cve.NewMatcher(cve.Config{Source: cfg.Source, NVDAPIKey: cfg.NVDAPIKey})
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-	defer cancel()
+	matcher, err := cve.NewMatcher(cve.Config{Source: cfg.Source, NVDAPIKey: cfg.NVDAPIKey})
+	if err != nil {
+		return nil, err
+	}
+	if w := matcher.Warning(); w != "" {
+		fmt.Fprintf(os.Stderr, "[cve] %s\n", w)
+	}
+
+	pkgs := make([]cve.Package, len(packages))
+	for i, pkg := range packages {
+		pkgs[i] = cve.Package{
+			Name:     pkg.Name,
+			Version:  pkg.Version,
+			Homepage: pkg.Homepage,
+			URL:      pkg.URL,
+		}
+	}
+	scanned := matcher.ScanAll(context.Background(), pkgs)
 
 	scanErrors := 0
-	for _, pkg := range packages {
-		vulns, errs := scanPackage(ctx, matcher, pkg)
-		result.Vulnerabilities = append(result.Vulnerabilities, vulns...)
-		scanErrors += len(errs)
+	for i, res := range scanned {
+		pkg := packages[i]
+		scanErrors += len(res.Errors)
 		if cfg.Verbose {
-			for _, e := range errs {
+			for _, e := range res.Errors {
 				fmt.Fprintf(os.Stderr, "[cve] %s: %v\n", pkg.Name, e)
 			}
+		}
+		for _, v := range res.Vulns {
+			result.Vulnerabilities = append(result.Vulnerabilities, VulnInfo{
+				Package:   pkg.Name,
+				Version:   pkg.Version,
+				CVEID:     v.ID,
+				Aliases:   v.Aliases,
+				Severity:  toAuditSeverity(v.Severity),
+				Summary:   v.Summary,
+				FixedIn:   v.FixedIn,
+				Reference: v.Reference,
+			})
 		}
 	}
 
 	result.VulnCount = len(result.Vulnerabilities)
-	if scanErrors > 0 && cfg.Verbose {
-		fmt.Fprintf(os.Stderr, "[cve] %d source error(s); results may be incomplete\n", scanErrors)
+	result.ScanErrors = scanErrors
+	if scanErrors > 0 {
+		return result, fmt.Errorf("cve scan incomplete: %d source error(s)", scanErrors)
 	}
 	return result, nil
 }
@@ -128,34 +157,6 @@ func AnalyzeTaps(cfg Config) (*TapAnalysisResult, error) {
 	return result, nil
 }
 
-// scanPackage resolves vulnerabilities for one formula via the shared CVE
-// matcher (OSV with real ecosystem mapping + NVD/CPE). It replaces two broken
-// implementations: the old queryOSV, which asked OSV for a non-existent
-// "Homebrew" ecosystem (matching nothing), and queryNVD, which flagged any CVE
-// whose description merely mentioned the formula name while ignoring the
-// installed version (a false-positive firehose for names like git/go/less).
-func scanPackage(ctx context.Context, m *cve.Matcher, pkg brew.InstalledPackage) ([]VulnInfo, []error) {
-	res := m.ScanPackage(ctx, cve.Package{
-		Name:     pkg.Name,
-		Version:  pkg.Version,
-		Homepage: pkg.Homepage,
-		URL:      pkg.URL,
-	})
-	var vulns []VulnInfo
-	for _, v := range res.Vulns {
-		vulns = append(vulns, VulnInfo{
-			Package:   pkg.Name,
-			Version:   pkg.Version,
-			CVEID:     v.ID,
-			Severity:  toAuditSeverity(v.Severity),
-			Summary:   v.Summary,
-			FixedIn:   v.FixedIn,
-			Reference: v.Reference,
-		})
-	}
-	return vulns, res.Errors
-}
-
 func toAuditSeverity(s cve.Severity) audit.Severity {
 	switch s {
 	case cve.SeverityCritical:
@@ -167,8 +168,6 @@ func toAuditSeverity(s cve.Severity) audit.Severity {
 	case cve.SeverityLow:
 		return audit.SeverityLow
 	default:
-		// Indeterminate severity on a matched CVE -> MEDIUM (needs triage),
-		// not INFO. See pkg/audit.toAuditSeverity for rationale.
 		return audit.SeverityMedium
 	}
 }
@@ -279,4 +278,3 @@ func analyzeTap(tap brew.Tap, cfg Config) []TapFinding {
 
 	return findings
 }
-

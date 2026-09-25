@@ -11,28 +11,43 @@ type osvCoord struct {
 	Name      string
 }
 
-// curatedOSV maps well-known Homebrew formulae to their real OSV coordinates.
-// These are formulae that ARE first-class packages in an OSV ecosystem, where
-// the formula name alone is not enough to derive the coordinate. Kept small and
-// authoritative on purpose: a wrong guess produces a bad query, and unmapped
-// formulae are covered by the NVD/CPE source instead.
+// curatedOSV is the formula-to-ecosystem map. A wrong guess is a bad query,
+// so anything not listed here is derived only from a package-host URL.
 var curatedOSV = map[string]osvCoord{
-	"awscli":    {"PyPI", "awscli"},
-	"ansible":   {"PyPI", "ansible"},
-	"httpie":    {"PyPI", "httpie"},
-	"yt-dlp":    {"PyPI", "yt-dlp"},
-	"pipenv":    {"PyPI", "pipenv"},
-	"poetry":    {"PyPI", "poetry"},
-	"ripgrep":   {"crates.io", "ripgrep"},
-	"fd":        {"crates.io", "fd-find"},
-	"bat":       {"crates.io", "bat"},
-	"eza":       {"crates.io", "eza"},
-	"exa":       {"crates.io", "exa"},
-	"starship":  {"crates.io", "starship"},
-	"deno":      {"crates.io", "deno"},
-	"yarn":      {"npm", "yarn"},
-	"pnpm":      {"npm", "pnpm"},
+	"awscli":     {"PyPI", "awscli"},
+	"ansible":    {"PyPI", "ansible"},
+	"httpie":     {"PyPI", "httpie"},
+	"yt-dlp":     {"PyPI", "yt-dlp"},
+	"pipenv":     {"PyPI", "pipenv"},
+	"poetry":     {"PyPI", "poetry"},
+	"ripgrep":    {"crates.io", "ripgrep"},
+	"fd":         {"crates.io", "fd-find"},
+	"bat":        {"crates.io", "bat"},
+	"eza":        {"crates.io", "eza"},
+	"exa":        {"crates.io", "exa"},
+	"starship":   {"crates.io", "starship"},
+	"deno":       {"crates.io", "deno"},
+	"yarn":       {"npm", "yarn"},
+	"pnpm":       {"npm", "pnpm"},
 	"typescript": {"npm", "typescript"},
+
+	"buf":           {"Go", "github.com/bufbuild/buf"},
+	"caddy":         {"Go", "github.com/caddyserver/caddy/v2"},
+	"consul":        {"Go", "github.com/hashicorp/consul"},
+	"cosign":        {"Go", "github.com/sigstore/cosign/v2"},
+	"delve":         {"Go", "github.com/go-delve/delve"},
+	"gh":            {"Go", "github.com/cli/cli"},
+	"golangci-lint": {"Go", "github.com/golangci/golangci-lint"},
+	"helm":          {"Go", "helm.sh/helm/v3"},
+	"hugo":          {"Go", "github.com/gohugoio/hugo"},
+	"nats-server":   {"Go", "github.com/nats-io/nats-server/v2"},
+	"nomad":         {"Go", "github.com/hashicorp/nomad"},
+	"prometheus":    {"Go", "github.com/prometheus/prometheus"},
+	"rclone":        {"Go", "github.com/rclone/rclone"},
+	"syncthing":     {"Go", "github.com/syncthing/syncthing"},
+	"terraform":     {"Go", "github.com/hashicorp/terraform"},
+	"trivy":         {"Go", "github.com/aquasecurity/trivy"},
+	"vault":         {"Go", "github.com/hashicorp/vault"},
 }
 
 // normalizeName strips a Homebrew versioned suffix: "openssl@3" -> "openssl".
@@ -67,11 +82,6 @@ func isAllDigits(s string) bool {
 	return true
 }
 
-// osvCoordinates returns the OSV coordinates to try for a formula. It combines
-// the curated map with a conservative host-based derivation from the download
-// URL / homepage. It deliberately does NOT fan out across every ecosystem the
-// way the old monitor code did — an unfounded ecosystem guess just produces
-// noise; formulae with no confident OSV coordinate are left to the NVD source.
 func osvCoordinates(p Package) []osvCoord {
 	base := normalizeName(p.Name)
 	var out []osvCoord
@@ -96,8 +106,13 @@ func osvCoordinates(p Package) []osvCoord {
 	return out
 }
 
-// coordFromURL derives an OSV coordinate from a well-known package-host URL.
-// Only high-confidence hosts are handled; anything else returns ok=false.
+// hostIs matches a domain or its subdomains. "notpypi.org" does not match "pypi.org".
+func hostIs(host, domain string) bool {
+	host = strings.TrimSuffix(strings.ToLower(host), ".")
+	domain = strings.ToLower(domain)
+	return host == domain || strings.HasSuffix(host, "."+domain)
+}
+
 func coordFromURL(raw string) (osvCoord, bool) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
@@ -111,33 +126,40 @@ func coordFromURL(raw string) (osvCoord, bool) {
 	segs := splitPath(u.Path)
 
 	switch {
-	case strings.Contains(host, "pypi.org") || strings.Contains(host, "pythonhosted.org"):
-		// https://pypi.org/project/<name>/ or .../packages/source/x/<name>/...
+	case hostIs(host, "pypi.org") || hostIs(host, "pythonhosted.org"):
+		// https://pypi.org/project/<name>/
 		if n := afterSegment(segs, "project"); n != "" {
 			return osvCoord{"PyPI", n}, true
 		}
-		if n := afterSegment(segs, "source"); n != "" {
-			// /packages/source/<a>/<name>/... -> take the segment after the letter
-			return osvCoord{"PyPI", n}, true
-		}
-	case strings.Contains(host, "registry.npmjs.org") || strings.Contains(host, "npmjs.com"):
-		if len(segs) >= 1 {
-			name := segs[0]
-			if name == "package" && len(segs) >= 2 {
-				name = segs[1]
+		// https://files.pythonhosted.org/packages/source/<letter>/<name>/...
+		for i, s := range segs {
+			if s == "source" && i+2 < len(segs) {
+				return osvCoord{"PyPI", segs[i+2]}, true
 			}
-			return osvCoord{"npm", name}, true
 		}
-	case strings.Contains(host, "crates.io") || strings.Contains(host, "static.crates.io"):
+	case hostIs(host, "npmjs.org") || hostIs(host, "npmjs.com"):
+		if len(segs) >= 1 {
+			if segs[0] == "package" && len(segs) >= 2 {
+				return osvCoord{"npm", segs[1]}, true
+			}
+			if strings.HasPrefix(segs[0], "@") && len(segs) >= 2 {
+				return osvCoord{"npm", segs[0] + "/" + segs[1]}, true
+			}
+			return osvCoord{"npm", segs[0]}, true
+		}
+	case hostIs(host, "crates.io"):
 		// https://crates.io/crates/<name> or /api/v1/crates/<name>/<ver>/download
 		if n := afterSegment(segs, "crates"); n != "" {
 			return osvCoord{"crates.io", n}, true
 		}
-	case host == "github.com" || strings.HasSuffix(host, ".github.com"):
-		// OSV Go advisories key on the module path github.com/<owner>/<repo>.
-		if len(segs) >= 2 {
-			repo := strings.TrimSuffix(segs[1], ".git")
-			return osvCoord{"Go", "github.com/" + segs[0] + "/" + repo}, true
+	case hostIs(host, "pkg.go.dev"):
+		if len(segs) >= 1 {
+			return osvCoord{"Go", strings.Join(segs, "/")}, true
+		}
+	case hostIs(host, "proxy.golang.org"):
+		joined := strings.Join(segs, "/")
+		if i := strings.Index(joined, "/@v/"); i > 0 {
+			return osvCoord{"Go", joined[:i]}, true
 		}
 	}
 	return osvCoord{}, false

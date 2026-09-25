@@ -14,9 +14,9 @@ import (
 
 // CombinedReport holds results from multiple scans
 type CombinedReport struct {
-	Audit   *audit.AuditResult       `json:"audit,omitempty"`
-	Vetting []*vetting.VetResult     `json:"vetting,omitempty"`
-	Monitor *monitor.CVEResult       `json:"monitor,omitempty"`
+	Audit   *audit.AuditResult   `json:"audit,omitempty"`
+	Vetting []*vetting.VetResult `json:"vetting,omitempty"`
+	Monitor *monitor.CVEResult   `json:"monitor,omitempty"`
 }
 
 // Output renders results in the specified format
@@ -75,8 +75,13 @@ func printAuditResult(r *audit.AuditResult) error {
 	fmt.Printf("Scanned: %d packages, %d taps\n", r.PackagesScanned, r.TapsScanned)
 	fmt.Printf("Time: %s\n\n", r.Timestamp.Format("2006-01-02 15:04:05"))
 
+	if r.CVEScanErrors > 0 {
+		fmt.Printf("CVE scan incomplete (%d source error(s)).\n\n", r.CVEScanErrors)
+	}
 	if len(r.Findings) == 0 {
-		fmt.Println("✅ No security issues found!")
+		if r.CVEScanErrors == 0 {
+			fmt.Println("✅ No security issues found!")
+		}
 		return nil
 	}
 
@@ -120,8 +125,13 @@ func printCVEResult(r *monitor.CVEResult) error {
 	fmt.Printf("Packages Checked: %d\n", r.PackagesChecked)
 	fmt.Printf("Vulnerabilities Found: %d\n\n", r.VulnCount)
 
+	if r.ScanErrors > 0 {
+		fmt.Printf("CVE scan incomplete (%d source error(s)).\n\n", r.ScanErrors)
+	}
 	if r.VulnCount == 0 {
-		fmt.Println("✅ No known vulnerabilities found!")
+		if r.ScanErrors == 0 {
+			fmt.Println("✅ No known vulnerabilities found!")
+		}
 		return nil
 	}
 
@@ -129,6 +139,9 @@ func printCVEResult(r *monitor.CVEResult) error {
 		icon := severityIcon(v.Severity)
 		fmt.Printf("%s [%s] %s @ %s\n", icon, v.Severity, v.Package, v.Version)
 		fmt.Printf("   CVE: %s\n", v.CVEID)
+		if len(v.Aliases) > 0 {
+			fmt.Printf("   Also: %s\n", strings.Join(v.Aliases, ", "))
+		}
 		if v.Summary != "" {
 			// Truncate long summaries
 			summary := v.Summary
@@ -223,6 +236,8 @@ func printCombinedReport(r CombinedReport) error {
 		}
 	}
 
+	degraded := (r.Audit != nil && r.Audit.CVEScanErrors > 0) || (r.Monitor != nil && r.Monitor.ScanErrors > 0)
+
 	fmt.Printf("Total Findings: %d\n", totalFindings)
 	fmt.Printf("Critical: %d | High: %d\n", criticalCount, highCount)
 
@@ -232,7 +247,7 @@ func printCombinedReport(r CombinedReport) error {
 		fmt.Println("\n⚠️  HIGH severity issues should be reviewed.")
 	} else if totalFindings > 0 {
 		fmt.Println("\n📝 Review findings and address as appropriate.")
-	} else {
+	} else if !degraded {
 		fmt.Println("\n✅ Your Homebrew installation looks secure!")
 	}
 

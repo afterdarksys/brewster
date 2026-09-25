@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
 
@@ -51,6 +52,17 @@ Detect bad distributors, abandoned projects, supply chain risks, and more.`,
 	}
 }
 
+// emit prints a result when one exists, then returns the scan error so a
+// degraded CVE lookup exits non-zero after the findings are visible.
+func emit(data any, err error) error {
+	if data != nil {
+		if outErr := report.Output(data, outputFmt); outErr != nil && err == nil {
+			return outErr
+		}
+	}
+	return err
+}
+
 // auditCmd - scan local brew installation
 func auditCmd() *cobra.Command {
 	var checkCVE bool
@@ -73,7 +85,10 @@ func auditCmd() *cobra.Command {
 				darkAPIURL = os.Getenv("DARKAPI_URL")
 			}
 
-			cveSrc, nvdKey := config.ResolveCVE(cveSource, "")
+			cveSrc, nvdKey, err := config.ResolveCVE(cveSource, "")
+			if err != nil {
+				return err
+			}
 			cfg := config.AuditConfig{
 				CheckCVE:        checkCVE,
 				CheckAbandoned:  checkAbandoned,
@@ -88,10 +103,9 @@ func auditCmd() *cobra.Command {
 
 			results, err := audit.RunLocalAudit(cfg)
 			if err != nil {
-				return fmt.Errorf("audit failed: %w", err)
+				err = fmt.Errorf("audit failed: %w", err)
 			}
-
-			return report.Output(results, outputFmt)
+			return emit(results, err)
 		},
 	}
 
@@ -150,12 +164,15 @@ func monitorCVECmd() *cobra.Command {
 		Use:   "cve",
 		Short: "Check ecosystem for CVE-affected packages",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			cveSrc, nvdKey := config.ResolveCVE(cveSource, "")
+			cveSrc, nvdKey, err := config.ResolveCVE(cveSource, "")
+			if err != nil {
+				return err
+			}
 			results, err := monitor.CheckCVEs(monitor.Config{Verbose: verbose, Source: cveSrc, NVDAPIKey: nvdKey})
 			if err != nil {
-				return fmt.Errorf("CVE check failed: %w", err)
+				err = fmt.Errorf("CVE check failed: %w", err)
 			}
-			return report.Output(results, outputFmt)
+			return emit(results, err)
 		},
 	}
 }
@@ -198,7 +215,11 @@ func scanCmd() *cobra.Command {
 
 			// Run local audit
 			fmt.Println("\n[1/3] Auditing local installation...")
-			cveSrc, nvdKey := config.ResolveCVE(cveSource, "")
+			cveSrc, nvdKey, err := config.ResolveCVE(cveSource, "")
+			if err != nil {
+				return err
+			}
+			var problems []error
 			auditResults, err := audit.RunLocalAudit(config.AuditConfig{
 				CheckCVE:        true,
 				CheckAbandoned:  true,
@@ -212,6 +233,7 @@ func scanCmd() *cobra.Command {
 			})
 			if err != nil {
 				fmt.Printf("  ⚠️  Audit error: %v\n", err)
+				problems = append(problems, err)
 			}
 
 			// Vet installed taps
@@ -226,6 +248,7 @@ func scanCmd() *cobra.Command {
 			monitorResults, err := monitor.CheckCVEs(monitor.Config{Verbose: verbose, Source: cveSrc, NVDAPIKey: nvdKey})
 			if err != nil {
 				fmt.Printf("  ⚠️  Monitor error: %v\n", err)
+				problems = append(problems, err)
 			}
 
 			// Combine results
@@ -236,7 +259,10 @@ func scanCmd() *cobra.Command {
 			}
 
 			fmt.Println("\n========================================")
-			return report.Output(combined, outputFmt)
+			if outErr := report.Output(combined, outputFmt); outErr != nil {
+				return outErr
+			}
+			return errors.Join(problems...)
 		},
 	}
 
@@ -361,7 +387,7 @@ func sbomCmd() *cobra.Command {
 			if err != nil {
 				return fmt.Errorf("failed to generate sbom: %w", err)
 			}
-			
+
 			fmt.Println(string(out))
 			return nil
 		},

@@ -3,40 +3,41 @@ package cve
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 )
 
-const defaultNVDEndpoint = "https://services.nvd.nist.gov/rest/json/cves/2.0"
+const (
+	defaultNVDEndpoint = "https://services.nvd.nist.gov/rest/json/cves/2.0"
+	nvdPageSize        = 2000
+	nvdMaxPages        = 25
+)
 
-// NVDSource queries the NVD 2.0 CVE API by CPE match string. Unlike the old
-// keyword-substring approach (which flagged any CVE whose description merely
-// mentioned the formula name, ignoring version — a false-positive firehose),
-// this asks NVD to match a versioned CPE so NVD performs the affected-range
-// check server-side.
+// NVDSource queries the NVD CVE API with a curated versioned CPE.
 type NVDSource struct {
 	Client      *http.Client
 	Endpoint    string
 	APIKey      string
 	MinInterval time.Duration
+	MaxBytes    int64
 
 	mu   sync.Mutex
 	last time.Time
 }
 
-// NewNVDSource returns an NVDSource. Without an API key NVD allows only ~5
-// requests/30s, so the interval is throttled accordingly; with a key it is ~50.
 func NewNVDSource(apiKey string) *NVDSource {
 	interval := 6 * time.Second
 	if strings.TrimSpace(apiKey) != "" {
 		interval = 700 * time.Millisecond
 	}
 	return &NVDSource{
-		Client:      &http.Client{Timeout: 20 * time.Second},
+		Client:      newHTTPClient(20 * time.Second),
 		Endpoint:    defaultNVDEndpoint,
 		APIKey:      strings.TrimSpace(apiKey),
 		MinInterval: interval,
@@ -45,13 +46,15 @@ func NewNVDSource(apiKey string) *NVDSource {
 
 func (s *NVDSource) Name() string { return "nvd" }
 
-// throttle blocks until MinInterval has elapsed since the previous request.
 func (s *NVDSource) throttle(ctx context.Context) error {
 	s.mu.Lock()
 	wait := time.Until(s.last.Add(s.MinInterval))
+	if wait < 0 {
+		wait = 0
+	}
 	s.last = time.Now().Add(wait)
 	s.mu.Unlock()
-	if wait <= 0 {
+	if wait == 0 {
 		return nil
 	}
 	timer := time.NewTimer(wait)
@@ -65,6 +68,7 @@ func (s *NVDSource) throttle(ctx context.Context) error {
 }
 
 type nvdResponse struct {
+	TotalResults    int `json:"totalResults"`
 	Vulnerabilities []struct {
 		CVE struct {
 			ID           string `json:"id"`
@@ -91,29 +95,76 @@ type nvdMetric struct {
 	} `json:"cvssData"`
 }
 
-// Query resolves vulns for p via a versioned CPE match string.
 func (s *NVDSource) Query(ctx context.Context, p Package) ([]Vuln, error) {
-	product := strings.ToLower(normalizeName(p.Name))
-	version := normalizeVersion(p.Version)
-	if product == "" || version == "" {
+	coords := curatedCPE[normalizeName(p.Name)]
+	if len(coords) == 0 {
 		return nil, nil
 	}
+	version := normalizeVersion(p.Version)
+	if version == "" {
+		return nil, fmt.Errorf("nvd: missing version for %s", p.Name)
+	}
 
-	// cpe:2.3:a:<vendor>:<product>:<version>:... — vendor wildcarded, version
-	// concrete so NVD applies affected-range matching.
-	cpe := fmt.Sprintf("cpe:2.3:a:*:%s:%s:*:*:*:*:*:*:*", product, version)
+	var out []Vuln
+	var errs []error
+	seen := map[string]bool{}
+	for _, c := range coords {
+		vulns, err := s.queryCPE(ctx, p, c, version)
+		for _, v := range vulns {
+			if seen[v.ID] {
+				continue
+			}
+			seen[v.ID] = true
+			out = append(out, v)
+		}
+		if err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return out, errors.Join(errs...)
+}
+
+func (s *NVDSource) queryCPE(ctx context.Context, p Package, c cpeCoord, version string) ([]Vuln, error) {
+	cpe := fmt.Sprintf("cpe:2.3:a:%s:%s:%s:*:*:*:*:*:*:*",
+		escapeCPE(c.Vendor), escapeCPE(c.Product), escapeCPE(version))
+
+	var out []Vuln
+	start := 0
+	total := -1
+	for page := 0; page < nvdMaxPages; page++ {
+		vulns, resp, err := s.queryPage(ctx, p, cpe, start)
+		if err != nil {
+			return out, err
+		}
+		if total == -1 {
+			total = resp.TotalResults
+		}
+		out = append(out, vulns...)
+		if len(out) >= total || total == 0 {
+			return out, nil
+		}
+		if len(resp.Vulnerabilities) == 0 {
+			return out, fmt.Errorf("nvd pagination stalled for %s at %d/%d", p.Name, len(out), total)
+		}
+		start += len(resp.Vulnerabilities)
+	}
+	return out, fmt.Errorf("nvd result cap for %s: %d of %d", p.Name, len(out), total)
+}
+
+func (s *NVDSource) queryPage(ctx context.Context, p Package, cpe string, start int) ([]Vuln, nvdResponse, error) {
 	q := url.Values{}
 	q.Set("virtualMatchString", cpe)
-	q.Set("resultsPerPage", "50")
+	q.Set("resultsPerPage", strconv.Itoa(nvdPageSize))
+	q.Set("startIndex", strconv.Itoa(start))
 	reqURL := s.Endpoint + "?" + q.Encode()
 
 	if err := s.throttle(ctx); err != nil {
-		return nil, err
+		return nil, nvdResponse{}, err
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
 	if err != nil {
-		return nil, fmt.Errorf("build nvd request: %w", err)
+		return nil, nvdResponse{}, fmt.Errorf("build nvd request: %w", err)
 	}
 	if s.APIKey != "" {
 		req.Header.Set("apiKey", s.APIKey)
@@ -121,33 +172,37 @@ func (s *NVDSource) Query(ctx context.Context, p Package) ([]Vuln, error) {
 
 	resp, err := s.Client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("nvd query %s: %w", product, err)
+		return nil, nvdResponse{}, fmt.Errorf("nvd query %s: %w", p.Name, err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("nvd query %s: unexpected status %d", product, resp.StatusCode)
+		return nil, nvdResponse{}, fmt.Errorf("nvd query %s: unexpected status %d", p.Name, resp.StatusCode)
 	}
 
+	body, err := readLimited(resp.Body, bodyLimit(s.MaxBytes))
+	if err != nil {
+		return nil, nvdResponse{}, fmt.Errorf("nvd read %s: %w", p.Name, err)
+	}
 	var r nvdResponse
-	if err := json.NewDecoder(resp.Body).Decode(&r); err != nil {
-		return nil, fmt.Errorf("nvd decode %s: %w", product, err)
+	if err := json.Unmarshal(body, &r); err != nil {
+		return nil, nvdResponse{}, fmt.Errorf("nvd decode %s: %w", p.Name, err)
 	}
 
 	var out []Vuln
 	for _, item := range r.Vulnerabilities {
-		c := item.CVE
+		cve := item.CVE
 		out = append(out, Vuln{
-			ID:        c.ID,
-			Summary:   nvdDescription(c.Descriptions),
-			Severity:  nvdSeverity(c.Metrics.CvssMetricV31, c.Metrics.CvssMetricV30, c.Metrics.CvssMetricV40),
-			Reference: nvdReference(c.References),
+			ID:        cve.ID,
+			Summary:   nvdDescription(cve.Descriptions),
+			Severity:  nvdSeverity(cve.Metrics.CvssMetricV31, cve.Metrics.CvssMetricV30, cve.Metrics.CvssMetricV40),
+			Reference: nvdReference(cve.References),
 			Source:    "nvd",
 			Package:   p.Name,
 			Version:   p.Version,
 		})
 	}
-	return out, nil
+	return out, r, nil
 }
 
 func nvdDescription(descs []struct {

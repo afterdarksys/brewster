@@ -55,11 +55,14 @@ type Finding struct {
 
 // AuditResult holds the results of an audit
 type AuditResult struct {
-	Timestamp      time.Time `json:"timestamp"`
-	PackagesScanned int      `json:"packages_scanned"`
-	TapsScanned     int      `json:"taps_scanned"`
+	Timestamp       time.Time `json:"timestamp"`
+	PackagesScanned int       `json:"packages_scanned"`
+	TapsScanned     int       `json:"taps_scanned"`
 	Findings        []Finding `json:"findings"`
 	Summary         Summary   `json:"summary"`
+	// CVEScanErrors is non-zero when a vulnerability source failed. The
+	// findings list is then incomplete and must not be read as "no CVEs".
+	CVEScanErrors int `json:"cve_scan_errors,omitempty"`
 }
 
 // Summary provides counts by severity
@@ -138,9 +141,12 @@ func RunLocalAudit(cfg config.AuditConfig) (*AuditResult, error) {
 	}
 
 	// Check for CVEs
+	var cveErr error
 	if cfg.CheckCVE {
-		findings := checkCVEs(packages, cfg)
+		findings, scanErrors, err := checkCVEs(packages, cfg)
+		result.CVEScanErrors = scanErrors
 		result.Findings = append(result.Findings, findings...)
+		cveErr = err
 
 		// Submit CVE findings to DarkAPI if enabled
 		if cfg.SubmitToDarkAPI {
@@ -157,7 +163,12 @@ func RunLocalAudit(cfg config.AuditConfig) (*AuditResult, error) {
 
 	// Calculate summary
 	result.Summary = calculateSummary(result.Findings)
-
+	if cveErr != nil {
+		return result, cveErr
+	}
+	if result.CVEScanErrors > 0 {
+		return result, fmt.Errorf("cve scan incomplete: %d source error(s)", result.CVEScanErrors)
+	}
 	return result, nil
 }
 
@@ -201,9 +212,9 @@ func checkAbandoned(pkg brew.InstalledPackage, verbose bool) []Finding {
 
 		if resp.StatusCode == 200 {
 			var repoInfo struct {
-				Archived  bool      `json:"archived"`
-				PushedAt  time.Time `json:"pushed_at"`
-				OpenIssues int      `json:"open_issues_count"`
+				Archived   bool      `json:"archived"`
+				PushedAt   time.Time `json:"pushed_at"`
+				OpenIssues int       `json:"open_issues_count"`
 			}
 
 			if err := json.NewDecoder(resp.Body).Decode(&repoInfo); err == nil {
@@ -223,10 +234,10 @@ func checkAbandoned(pkg brew.InstalledPackage, verbose bool) []Finding {
 				// Check for inactivity (no commits in 2 years)
 				if time.Since(repoInfo.PushedAt) > 2*365*24*time.Hour {
 					findings = append(findings, Finding{
-						Package:     pkg.FullName,
-						Type:        FindingAbandoned,
-						Severity:    SeverityLow,
-						Title:       "Repository appears abandoned",
+						Package:  pkg.FullName,
+						Type:     FindingAbandoned,
+						Severity: SeverityLow,
+						Title:    "Repository appears abandoned",
 						Description: fmt.Sprintf("No commits to %s/%s in over 2 years (last: %s)",
 							owner, repo, repoInfo.PushedAt.Format("2006-01-02")),
 						URL:         fmt.Sprintf("https://github.com/%s/%s", owner, repo),
@@ -240,22 +251,30 @@ func checkAbandoned(pkg brew.InstalledPackage, verbose bool) []Finding {
 	return findings
 }
 
-func checkCVEs(packages []brew.InstalledPackage, cfg config.AuditConfig) []Finding {
-	matcher := cve.NewMatcher(cve.Config{Source: cfg.CVESource, NVDAPIKey: cfg.NVDAPIKey})
+func checkCVEs(packages []brew.InstalledPackage, cfg config.AuditConfig) ([]Finding, int, error) {
+	matcher, err := cve.NewMatcher(cve.Config{Source: cfg.CVESource, NVDAPIKey: cfg.NVDAPIKey})
+	if err != nil {
+		return nil, 0, err
+	}
+	if w := matcher.Warning(); w != "" {
+		fmt.Fprintf(os.Stderr, "[cve] %s\n", w)
+	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-	defer cancel()
-
-	var findings []Finding
-	scanErrors := 0
-
-	for _, pkg := range packages {
-		res := matcher.ScanPackage(ctx, cve.Package{
+	pkgs := make([]cve.Package, len(packages))
+	for i, pkg := range packages {
+		pkgs[i] = cve.Package{
 			Name:     pkg.Name,
 			Version:  pkg.Version,
 			Homepage: pkg.Homepage,
 			URL:      pkg.URL,
-		})
+		}
+	}
+	results := matcher.ScanAll(context.Background(), pkgs)
+
+	var findings []Finding
+	scanErrors := 0
+	for i, res := range results {
+		pkg := packages[i]
 		scanErrors += len(res.Errors)
 		if cfg.Verbose {
 			for _, e := range res.Errors {
@@ -263,11 +282,15 @@ func checkCVEs(packages []brew.InstalledPackage, cfg config.AuditConfig) []Findi
 			}
 		}
 		for _, v := range res.Vulns {
+			title := v.ID
+			if len(v.Aliases) > 0 {
+				title += " (" + strings.Join(v.Aliases, ", ") + ")"
+			}
 			findings = append(findings, Finding{
 				Package:     pkg.FullName,
 				Type:        FindingCVE,
 				Severity:    toAuditSeverity(v.Severity),
-				Title:       fmt.Sprintf("Known vulnerability: %s", v.ID),
+				Title:       "Known vulnerability: " + title,
 				Description: v.Summary,
 				CVE:         v.ID,
 				URL:         v.Reference,
@@ -276,20 +299,7 @@ func checkCVEs(packages []brew.InstalledPackage, cfg config.AuditConfig) []Findi
 		}
 	}
 
-	// Fail loud: a lookup that errored is NOT a clean result. Surface it so an
-	// empty findings list is never silently mistaken for "no vulnerabilities" —
-	// the exact failure the old Homebrew-ecosystem query produced on every run.
-	if scanErrors > 0 {
-		findings = append(findings, Finding{
-			Type:        FindingCVE,
-			Severity:    SeverityInfo,
-			Title:       "CVE scan degraded",
-			Description: fmt.Sprintf("%d vulnerability-source error(s) occurred; CVE results may be incomplete.", scanErrors),
-			Remediation: "Re-run with --verbose; check access to api.osv.dev / services.nvd.nist.gov and NVD_API_KEY.",
-		})
-	}
-
-	return findings
+	return findings, scanErrors, nil
 }
 
 func toAuditSeverity(s cve.Severity) Severity {
@@ -303,10 +313,6 @@ func toAuditSeverity(s cve.Severity) Severity {
 	case cve.SeverityLow:
 		return SeverityLow
 	default:
-		// A matched CVE whose severity couldn't be determined still warrants
-		// review, so surface it as MEDIUM rather than INFO ("no action"). This
-		// is common for OSV Go-DB (GO-xxxx) records, whose severity lives only
-		// on their GHSA/CVE alias — resolving that alias is a possible follow-up.
 		return SeverityMedium
 	}
 }

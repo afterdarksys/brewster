@@ -11,69 +11,69 @@ import (
 
 // Formula represents a Homebrew formula
 type Formula struct {
-	Name             string   `json:"name"`
-	FullName         string   `json:"full_name"`
-	Tap              string   `json:"tap"`
-	Version          string   `json:"versions,omitempty"`
-	Homepage         string   `json:"homepage"`
-	URL              string   `json:"url"`
-	Sha256           string   `json:"sha256,omitempty"`
-	Deprecated       bool     `json:"deprecated"`
-	Disabled         bool     `json:"disabled"`
-	DeprecationDate  string   `json:"deprecation_date,omitempty"`
-	DeprecationReason string  `json:"deprecation_reason,omitempty"`
-	InstalledVersion string   `json:"-"`
+	Name              string `json:"name"`
+	FullName          string `json:"full_name"`
+	Tap               string `json:"tap"`
+	Version           string `json:"versions,omitempty"`
+	Homepage          string `json:"homepage"`
+	URL               string `json:"url"`
+	Sha256            string `json:"sha256,omitempty"`
+	Deprecated        bool   `json:"deprecated"`
+	Disabled          bool   `json:"disabled"`
+	DeprecationDate   string `json:"deprecation_date,omitempty"`
+	DeprecationReason string `json:"deprecation_reason,omitempty"`
+	InstalledVersion  string `json:"-"`
 }
 
 // Tap represents a Homebrew tap
 type Tap struct {
-	Name       string `json:"name"`
-	Remote     string `json:"remote"`
-	Path       string `json:"path"`
-	Official   bool   `json:"official"`
-	FormulaCount int  `json:"-"`
-	CaskCount    int  `json:"-"`
+	Name         string `json:"name"`
+	Remote       string `json:"remote"`
+	Path         string `json:"path"`
+	Official     bool   `json:"official"`
+	FormulaCount int    `json:"-"`
+	CaskCount    int    `json:"-"`
 }
 
 // InstalledPackage represents an installed package
 type InstalledPackage struct {
-	Name             string   `json:"name"`
-	FullName         string   `json:"full_name"`
-	Tap              string   `json:"tap"`
-	Version          string   `json:"installed_version"`
-	Homepage         string   `json:"homepage"`
-	URL              string   `json:"url"`
-	Dependencies     []string `json:"dependencies"`
+	Name              string   `json:"name"`
+	FullName          string   `json:"full_name"`
+	Tap               string   `json:"tap"`
+	Version           string   `json:"installed_version"`
+	Homepage          string   `json:"homepage"`
+	URL               string   `json:"url"`
+	Dependencies      []string `json:"dependencies"`
 	BuildDependencies []string `json:"build_dependencies"`
 }
 
 // Cask represents a Homebrew cask (macOS application)
 type Cask struct {
-	Token       string   `json:"token"`
-	FullToken   string   `json:"full_token"`
-	Tap         string   `json:"tap"`
-	Name        []string `json:"name"`
-	Version     string   `json:"version"`
-	Homepage    string   `json:"homepage"`
-	URL         string   `json:"url"`
-	Sha256      string   `json:"sha256"`
-	Artifacts   []string `json:"-"`
-	Deprecated  bool     `json:"deprecated"`
-	Disabled    bool     `json:"disabled"`
+	Token      string   `json:"token"`
+	FullToken  string   `json:"full_token"`
+	Tap        string   `json:"tap"`
+	Name       []string `json:"name"`
+	Version    string   `json:"version"`
+	Homepage   string   `json:"homepage"`
+	URL        string   `json:"url"`
+	Sha256     string   `json:"sha256"`
+	Artifacts  []string `json:"-"`
+	Deprecated bool     `json:"deprecated"`
+	Disabled   bool     `json:"disabled"`
 }
 
 // InstalledCask represents an installed cask
 type InstalledCask struct {
-	Token          string   `json:"token"`
-	FullToken      string   `json:"full_token"`
-	Tap            string   `json:"tap"`
-	Name           []string `json:"name"`
-	Version        string   `json:"version"`
-	InstalledVersion string `json:"installed_version"`
-	Homepage       string   `json:"homepage"`
-	URL            string   `json:"url"`
-	Sha256         string   `json:"sha256"`
-	Outdated       bool     `json:"outdated"`
+	Token            string   `json:"token"`
+	FullToken        string   `json:"full_token"`
+	Tap              string   `json:"tap"`
+	Name             []string `json:"name"`
+	Version          string   `json:"version"`
+	InstalledVersion string   `json:"installed_version"`
+	Homepage         string   `json:"homepage"`
+	URL              string   `json:"url"`
+	Sha256           string   `json:"sha256"`
+	Outdated         bool     `json:"outdated"`
 }
 
 // GetBrewPrefix returns the Homebrew prefix
@@ -94,11 +94,11 @@ func GetInstalledFormulae() ([]InstalledPackage, error) {
 
 	var result struct {
 		Formulae []struct {
-			Name      string `json:"name"`
-			FullName  string `json:"full_name"`
-			Tap       string `json:"tap"`
-			Homepage  string `json:"homepage"`
-			URLs      struct {
+			Name     string `json:"name"`
+			FullName string `json:"full_name"`
+			Tap      string `json:"tap"`
+			Homepage string `json:"homepage"`
+			URLs     struct {
 				Stable struct {
 					URL string `json:"url"`
 				} `json:"stable"`
@@ -117,24 +117,37 @@ func GetInstalledFormulae() ([]InstalledPackage, error) {
 
 	var packages []InstalledPackage
 	for _, f := range result.Formulae {
-		version := ""
-		if len(f.Installed) > 0 {
-			version = f.Installed[0].Version
+		versions := make([]string, 0, len(f.Installed))
+		for _, inst := range f.Installed {
+			versions = append(versions, inst.Version)
 		}
-
-		packages = append(packages, InstalledPackage{
+		packages = append(packages, expandInstalled(InstalledPackage{
 			Name:              f.Name,
 			FullName:          f.FullName,
 			Tap:               f.Tap,
-			Version:           version,
 			Homepage:          f.Homepage,
 			URL:               f.URLs.Stable.URL,
 			Dependencies:      f.Dependencies,
 			BuildDependencies: f.BuildDependencies,
-		})
+		}, versions)...)
 	}
 
 	return packages, nil
+}
+
+// expandInstalled returns one row per installed keg. An empty list still
+// returns the formula so a missing version is reported.
+func expandInstalled(base InstalledPackage, versions []string) []InstalledPackage {
+	if len(versions) == 0 {
+		return []InstalledPackage{base}
+	}
+	out := make([]InstalledPackage, 0, len(versions))
+	for _, v := range versions {
+		p := base
+		p.Version = v
+		out = append(out, p)
+	}
+	return out
 }
 
 // GetInstalledTaps returns all installed taps
